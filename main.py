@@ -1,56 +1,57 @@
-import asyncio
-from typing import Dict, Any
-from redis.asyncio import Redis
-from rmq import RabbitMQClient
-from dotenv import load_dotenv
-import os
-import json
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Path
+import asyncio, json
 from executor import run_code_in_docker
 
-load_dotenv()
-rmq = RabbitMQClient(os.getenv("RABBITMQ_URL"))
-redis_client = Redis.from_url(os.getenv("REDIS_URL"), decode_responses=True)
+app = FastAPI(description="Code Executor Worker Server")
 
-async def process_execution_job(job_data:Dict[str,Any]):
-    """
-    processing job received from message queue 
-    """
-    job_id = job_data.get("job_id")
-    response_channel = job_data.get("response_channel")
-    if not response_channel:
-    	print(f"Warning: Skip response channel not fixed job{job_id}")
-    	return 
-    	
-    result = await run_code_in_docker(language=job_data.get("language"),
-                                code=job_data.get("code"))
-    result_message = {
-        "job_id" : job_id,
-        "result" : result
-    }
-    print(f"Redis Channel: Publish to {response_channel}")
-    await redis_client.publish(response_channel, json.dumps(result))
+@app.websocket("/ws/worker/{language}")
+async def websocket_execute(websocket:WebSocket, 
+                            language:str=Path(...),
+                            job_id:str=Query(...)):
     
-    #await rmq.publish_message("execution_result_queue", result_message)
+    await websocket.accept()
+    print(f"New execution session {job_id}")
+    
+    try:
+        init_msg = await websocket.receive_text()
+        data = json.loads(init_msg)
+        code = data.get("code")
+        if not code:
+            await websocket.send_json({"type" : "error", "message" : "No code provided"})
+            await websocket.close()
+            return
+    except Exception:
+        await websocket.send_json({"type" : "error", "message" : "Invalid initial message"})
 
-async def main():
-    """
-    Connect RabbitMQ and consume message 
-    """
-    await rmq.connect()
+    input_queue = asyncio.Queue()
     
-    await rmq.start_consuming(
-        queue_name="code_execution_queue",
-        on_message_callback=process_execution_job
+    async def output_callback(type_:str, data_:str):
+        await websocket.send_json({"type" : type_, "data" : data_})
+    
+    async def read_client_input():
+        try:
+            while True:
+                msg = await websocket.receive_text()
+                await input_queue.put(msg + "\n")
+        except WebSocketDisconnect:
+            print(f"Client disconnected: {job_id}")
+            await input_queue.put(None)
+    
+    worker_task = asyncio.create_task(
+        run_code_in_docker(language=language, code=code, job_id=job_id, input_queue=input_queue, output_callback=output_callback)
     )
+    input_task = asyncio.create_task(read_client_input())
+    
+    done, pending = await asyncio.wait(
+        [worker_task, input_task],
+        return_when=asyncio.FIRST_COMPLETED
+    )
+    for task in pending:
+        task.cancel()
+    print(f"Session {job_id} closed")
+    await websocket.close()
 
 if __name__ == "__main__":
-    try:
-        print("Server start.. Waiting for job")
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("KeybordInterrupt detected. Worker Server closed.")
-    finally:
-    	loop = asyncio.get_event_loop()
-    	loop.run_until_complete(rmq.close())
-    	loop.run_until_complete(redis_client.close())
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
     

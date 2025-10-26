@@ -2,47 +2,36 @@ import docker
 import time
 import os
 import tempfile
-from docker.errors import ContainerError, DockerException, APIError, NotFound
+from docker.errors import APIError, NotFound
 from config import LANGUAGE_CONFIG, EXECUTION_TIME_LIMIT
 import asyncio
-from typing import Dict, Any
+from typing import Callable, Coroutine
 import logging
 from utils.extract import extract_java_main_class
 
-async def run_code_in_docker(language:str, code:str)->Dict[str,Any]:
+async def run_code_in_docker(
+    language: str,
+    code: str,
+    job_id: str,
+    input_queue: asyncio.Queue,
+    output_callback: Callable[[str, str], Coroutine]
+):
     """
-    Code execution sandbox 
-    execute code and return result to message queue.
-    params:
-    - langauge: programming language from message queue
-    - code: user's code for execution
-    result:
-    - dict: status, stdout, stderr, execution_time
+    Docker 컨테이너와 실시간 양방향(stdin/stdout) 통신을 수행
     """
-    start_time = time.time()
-    
     config = LANGUAGE_CONFIG.get(language)
     if not config:
-        execution_time = time.time() - start_time
-        return {
-            "status" : "error",
-            "stdout" : "",
-            "stderr" : f"Unsupported language: {language}",
-            "execution_time" : execution_time
-    }
-    
-    # make temporary directory and save code in 'main' file
-    temp_dir = tempfile.TemporaryDirectory() 
-    container = None
-    
+        await output_callback("stderr", f"Unsupported language: {language}")
+        return
+
+    temp_dir = tempfile.TemporaryDirectory()
+    container: docker.models.containers.Container = None
     try:
-        # Execute docker container
         client = docker.from_env()
         
         filename = config["filename"]
         exec_command = config["command"](filename)
         
-        # Extract class name if name is not 'Main'
         if language == 'java':
             main_class_name = extract_java_main_class(code=code)
             if not main_class_name:
@@ -53,56 +42,77 @@ async def run_code_in_docker(language:str, code:str)->Dict[str,Any]:
         
         file_path = os.path.join(temp_dir.name, filename)
         with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(code)
-                
+            f.write(code)
+            
         container = await asyncio.to_thread(
-                client.containers.run,
-                image=config["image"],
-                command=exec_command,
-                volumes={temp_dir.name : {'bind' : '/app'}},
-                working_dir="/app",
-                detach=True, # run on background
-                mem_limit="128m", # memory limit(128mb)
-                nano_cpus=int(0.5*10**9), # CPU Core limit(0.5 cpu core) 
-                network_disabled=True
+            client.containers.run,
+            image=config["image"],
+            command=exec_command,
+            volumes={temp_dir.name: {'bind': '/app'}},
+            working_dir="/app",
+            detach=True,
+            stdin_open=True,
+            tty=True,
+            mem_limit="128m",
+            nano_cpus=int(0.5 * 10**9),
+            network_disabled=True
         )
+
+        sock = await asyncio.to_thread(
+            container.attach_socket,
+            params={'stdin': 1, 'stdout': 1, 'stderr': 1, 'stream': 1}
+        )
+        reader, writer = await asyncio.open_connection(sock=sock._sock)
+
+        async def forward_container_output():
+            """컨테이너의 출력을 WebSocket으로 전달"""
+            try:
+                while not reader.at_eof():
+                    data = await reader.read(4096)
+                    if not data:
+                        break
+                    await output_callback("stdout", data.decode('utf-8', errors='ignore'))
+            except Exception as e:
+                logging.warning(f"Output streaming error for {job_id}: {e}")
+            finally:
+                pass
+
+        async def forward_client_input():
+            """WebSocket의 입력을 컨테이너로 전달"""
+            try:
+                while True:
+                    data_to_write = await input_queue.get()
+                    if data_to_write is None:
+                        break
+                    writer.write(data_to_write.encode('utf-8'))
+                    await writer.drain()
+            except Exception as e:
+                logging.warning(f"Input streaming error for {job_id}: {e}")
+
+        output_task = asyncio.create_task(forward_container_output())
+        input_task = asyncio.create_task(forward_client_input())
+        
         try:
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(container.wait),
-                    timeout=EXECUTION_TIME_LIMIT
-                )
-                stdout = (await asyncio.to_thread(container.logs, stdout=True, stderr=False)).decode('utf-8')
-                stderr = (await asyncio.to_thread(container.logs, stdout=False, stderr=True)).decode('utf-8')
-                    
-                status = "success" if result['StatusCode'] == 0 else "error"
-                
+            done, pending = await asyncio.wait_for(
+                asyncio.wait([output_task, input_task], return_when=asyncio.FIRST_COMPLETED),
+                timeout=EXECUTION_TIME_LIMIT
+            )
+            for task in pending: task.cancel()
         except asyncio.TimeoutError:
-                logging.warning("Execution timed out. Stopping container")
-                await asyncio.to_thread(container.stop)
-                status = "timeout"
-                stdout = ""
-                stderr = f"Execution exceeded the time limit of {EXECUTION_TIME_LIMIT} seconds"
-    except (DockerException, APIError, ContainerError) as e:
-        status = "error"
-        stdout = ""
-        stderr = e.stderr.decode('utf-8') if e.stderr else str(e)
+            logging.warning(f"Execution time out for {job_id}")
+            await output_callback("stderr", f"\nExecution exceeded the time limit of {EXECUTION_TIME_LIMIT} seconds")
+            for task in [output_task, input_task]: task.cancel()
+            
     except Exception as e:
-        status = "error"
-        stdout = ""
-        stderr = f"An unexpected error occured: {e}"
+        await output_callback("stderr", f"\nAn unexpected error occurred: {str(e)}")
     finally:
+        await input_queue.put(None) # 입력 작업 종료
         if container:
             try:
-                await asyncio.to_thread(container.remove, force=True)
-            except NotFound:
-                pass
+                await asyncio.to_thread(container.stop, timeout=2)
+                await asyncio.to_thread(container.remove)
+            except (NotFound, APIError) as e:
+                logging.warning(f"Failed to stop/remove container {job_id}: {str(e)}")
         temp_dir.cleanup()
-        print("Temporary directory and container clean up(remove)")
-    execution_time = time.time() - start_time
-    
-    return {
-        "status" : status,
-        "stdout" : stdout,
-        "stderr" : stderr,
-        "execution_time" : round(execution_time,4)
-    }
+        print(f"Temporary directory and container cleaned up for {job_id}")
+        await output_callback("status", "END_OF_STREAM")

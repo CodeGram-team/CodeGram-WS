@@ -35,4 +35,4 @@ LANGUAGE_CONFIG = {
     },
     
 }
-EXECUTION_TIME_LIMIT=5 # Maximum execution time limit
+EXECUTION_TIME_LIMIT=60 # Maximum execution time limit
